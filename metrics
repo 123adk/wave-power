@@ -1,0 +1,467 @@
+"""Time-series Generative Adversarial Networks (TimeGAN) Codebase - PyTorch Implementation
+
+Reference: Jinsung Yoon, Daniel Jarrett, Mihaela van der Schaar,
+"Time-series Generative Adversarial Networks,"
+Neural Information Processing Systems (NeurIPS), 2019.
+
+Paper link: https://papers.nips.cc/paper/8789-time-series-generative-adversarial-networks
+
+Last updated Date: 2025-10-17
+Converted to PyTorch by: GitHub Copilot
+
+-----------------------------
+
+discriminative_metrics.py (PyTorch Version)
+
+Note: Use post-hoc RNN to classify original data and synthetic data
+
+Output: discriminative score (np.abs(classification accuracy - 0.5))
+"""
+
+# Necessary Packages
+import torch
+import torch.nn as nn
+import numpy as np
+from sklearn.metrics import accuracy_score
+from utils import train_test_divide, extract_time, batch_generator
+
+
+class Discriminator(nn.Module):
+    """Simple discriminator network."""
+
+    def __init__(self, input_dim, hidden_dim):
+        super(Discriminator, self).__init__()
+        self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x, lengths):
+        # Pack padded sequence
+        packed_input = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        _, h_n = self.rnn(packed_input)
+        # Use last hidden state
+        y_hat = self.fc(h_n.squeeze(0))
+        return y_hat
+
+
+def discriminative_score_metrics(ori_data, generated_data):
+    """Use post-hoc RNN to classify original data and synthetic data
+
+    Args:
+        - ori_data: original data (原始尺度，未归一化)
+        - generated_data: generated synthetic data (原始尺度，未归一化)
+
+    Returns:
+        - discriminative_score: np.abs(classification accuracy - 0.5)
+    """
+
+    # ========== 添加数据验证 ==========
+    print(f'\n🔍 Discriminative Metrics - 数据检查:')
+
+    ori_array = np.array([d for d in ori_data])
+    gen_array = np.array([d for d in generated_data])
+
+    print(f'  原始数据范围: [{ori_array.min():.4f}, {ori_array.max():.4f}]')
+    print(f'  生成数据范围: [{gen_array.min():.4f}, {gen_array.max():.4f}]')
+
+    # 检查异常值
+    if np.isnan(gen_array).any() or np.isinf(gen_array).any():
+        print(f'  ❌ 错误: 生成数据包含 NaN 或 Inf!')
+        return 0.5  # 返回 0.5 表示完全无法区分（最差情况）
+
+    # Basic Parameters
+    no, seq_len, dim = np.asarray(ori_data).shape
+
+    # Set maximum sequence length and each sequence length
+    ori_time, ori_max_seq_len = extract_time(ori_data)
+    generated_time, generated_max_seq_len = extract_time(generated_data)
+    max_seq_len = max([ori_max_seq_len, generated_max_seq_len])
+
+    # ========== 归一化数据（用于判别器训练）==========
+    def normalize_data(data):
+        """归一化数据"""
+        data_array = np.array([d for d in data])
+        min_val = data_array.min(axis=(0, 1))
+        max_val = data_array.max(axis=(0, 1))
+
+        normalized = []
+        for d in data:
+            norm_d = (d - min_val) / (max_val - min_val + 1e-7)
+            normalized.append(norm_d)
+
+        return normalized
+
+    # 合并所有数据进行统一归一化
+    all_data = list(ori_data) + list(generated_data)
+    all_data_norm = normalize_data(all_data)
+
+    # 分离归一化后的数据
+    ori_data_norm = all_data_norm[:len(ori_data)]
+    generated_data_norm = all_data_norm[len(ori_data):]
+
+    print(f'  ✅ 数据已归一化用于判别器训练')
+
+    # Network parameters
+    hidden_dim = int(dim / 2)
+    iterations = 2000
+    batch_size = 128
+
+    # Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Build discriminator
+    discriminator = Discriminator(dim, hidden_dim).to(device)
+
+    # Loss and optimizer
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(discriminator.parameters())
+
+    # Train/test division (使用归一化后的数据)
+    train_x, train_x_hat, test_x, test_x_hat, train_t, train_t_hat, test_t, test_t_hat = \
+        train_test_divide(ori_data_norm, generated_data_norm, ori_time, generated_time)
+
+    # ... (训练代码保持不变，使用归一化后的数据) ...
+
+    # Training
+    discriminator.train()
+    for itt in range(iterations):
+        # Batch setting
+        X_mb, T_mb = batch_generator(train_x, train_t, batch_size)
+        X_hat_mb, T_hat_mb = batch_generator(train_x_hat, train_t_hat, batch_size)
+
+        # Convert to tensors
+        X_mb = torch.FloatTensor(np.array(X_mb)).to(device)
+        X_hat_mb = torch.FloatTensor(np.array(X_hat_mb)).to(device)
+        T_mb = torch.LongTensor(T_mb).cpu()
+        T_hat_mb = torch.LongTensor(T_hat_mb).cpu()
+
+        # Labels
+        y_real = torch.ones(len(X_mb), 1).to(device)
+        y_fake = torch.zeros(len(X_hat_mb), 1).to(device)
+
+        # Forward pass
+        y_pred_real = discriminator(X_mb, T_mb)
+        y_pred_fake = discriminator(X_hat_mb, T_hat_mb)
+
+        # Compute loss
+        d_loss_real = criterion(y_pred_real, y_real)
+        d_loss_fake = criterion(y_pred_fake, y_fake)
+        d_loss = d_loss_real + d_loss_fake
+
+        # Backward and optimize
+        optimizer.zero_grad()
+        d_loss.backward()
+        optimizer.step()
+
+    # Test the performance on the testing set
+    discriminator.eval()
+    with torch.no_grad():
+        # Convert test data to tensors
+        test_x_tensor = torch.FloatTensor(np.array(test_x)).to(device)
+        test_x_hat_tensor = torch.FloatTensor(np.array(test_x_hat)).to(device)
+        test_t_tensor = torch.LongTensor(test_t).cpu()
+        test_t_hat_tensor = torch.LongTensor(test_t_hat).cpu()
+
+        # Predictions
+        y_pred_real_curr = torch.sigmoid(discriminator(test_x_tensor, test_t_tensor))
+        y_pred_fake_curr = torch.sigmoid(discriminator(test_x_hat_tensor, test_t_hat_tensor))
+
+    # Convert to numpy
+    y_pred_real_curr = y_pred_real_curr.cpu().numpy()
+    y_pred_fake_curr = y_pred_fake_curr.cpu().numpy()
+
+    y_pred_final = np.squeeze(np.concatenate((y_pred_real_curr, y_pred_fake_curr), axis=0))
+    y_label_final = np.concatenate((np.ones([len(y_pred_real_curr), ]),
+                                    np.zeros([len(y_pred_fake_curr), ])), axis=0)
+
+    # Compute the accuracy
+    acc = accuracy_score(y_label_final, (y_pred_final > 0.5))
+    discriminative_score = np.abs(0.5 - acc)
+
+    print(f'  📊 Discriminative Score: {discriminative_score:.4f}')
+
+    return discriminative_score
+"""Time-series Generative Adversarial Networks (TimeGAN) Codebase - PyTorch Implementation
+
+Reference: Jinsung Yoon, Daniel Jarrett, Mihaela van der Schaar,
+"Time-series Generative Adversarial Networks,"
+Neural Information Processing Systems (NeurIPS), 2019.
+
+Paper link: https://papers.nips.cc/paper/8789-time-series-generative-adversarial-networks
+
+Last updated Date: 2025-10-17
+Converted to PyTorch by: GitHub Copilot
+
+-----------------------------
+
+predictive_metrics.py (PyTorch Version)
+
+Note: Use Post-hoc RNN to predict one-step ahead (last feature)
+"""
+
+# Necessary Packages
+import torch
+import torch.nn as nn
+import numpy as np
+from sklearn.metrics import mean_absolute_error
+from utils import extract_time
+
+
+class Predictor(nn.Module):
+    """Simple predictor network."""
+
+    def __init__(self, input_dim, hidden_dim):
+        super(Predictor, self).__init__()
+        self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, lengths):
+        # Pack padded sequence
+        packed_input = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        packed_output, _ = self.rnn(packed_input)
+        output, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
+
+        # Apply fully connected layer
+        y_hat = self.sigmoid(self.fc(output))
+        return y_hat
+
+
+def predictive_score_metrics(ori_data, generated_data):
+    """Report the performance of Post-hoc RNN one-step ahead prediction.
+
+    Args:
+        - ori_data: original data (原始尺度，未归一化)
+        - generated_data: generated synthetic data (原始尺度，未归一化)
+
+    Returns:
+        - predictive_score: MAE of the predictions on the original data
+    """
+
+    # ========== 添加数据验证 ==========
+    print(f'\n🔍 Predictive Metrics - 数据检查:')
+
+    # 检查数据范围
+    ori_array = np.array([d for d in ori_data])
+    gen_array = np.array([d for d in generated_data])
+
+    print(f'  原始数据范围: [{ori_array.min():.4f}, {ori_array.max():.4f}]')
+    print(f'  生成数据范围: [{gen_array.min():.4f}, {gen_array.max():.4f}]')
+    print(f'  原始数据均值: {ori_array.mean():.4f}')
+    print(f'  生成数据均值: {gen_array.mean():.4f}')
+
+    # 检查异常值
+    if np.isnan(gen_array).any() or np.isinf(gen_array).any():
+        print(f'  ❌ 错误: 生成数据包含 NaN 或 Inf，无法进行评估!')
+        return float('inf')
+
+    if abs(gen_array.max()) > 1e8 or abs(gen_array.min()) > 1e8:
+        print(f'  ⚠️  警告: 生成数据数值异常，评估结果可能不准确!')
+
+    # Basic Parameters
+    no, seq_len, dim = np.asarray(ori_data).shape
+
+    # Set maximum sequence length and each sequence length
+    ori_time, ori_max_seq_len = extract_time(ori_data)
+    generated_time, generated_max_seq_len = extract_time(generated_data)
+    max_seq_len = max([ori_max_seq_len, generated_max_seq_len])
+
+    # Network parameters
+    hidden_dim = int(dim / 2)
+    iterations = 5000
+    batch_size = 128
+
+    # Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # ========== 对数据进行归一化（用于训练预测器）==========
+    # 注意: 这里需要归一化，因为神经网络训练需要标准化的输入
+    def normalize_data(data):
+        """归一化数据用于神经网络训练"""
+        data_array = np.array([d for d in data])
+        min_val = data_array.min(axis=(0, 1))
+        max_val = data_array.max(axis=(0, 1))
+
+        normalized = []
+        for d in data:
+            norm_d = (d - min_val) / (max_val - min_val + 1e-7)
+            normalized.append(norm_d)
+
+        return normalized, min_val, max_val
+
+    # 归一化训练数据（generated_data）
+    generated_data_norm, gen_min, gen_max = normalize_data(generated_data)
+
+    # 归一化测试数据（ori_data）- 使用相同的归一化参数
+    ori_data_norm = []
+    for d in ori_data:
+        norm_d = (d - gen_min) / (gen_max - gen_min + 1e-7)
+        ori_data_norm.append(norm_d)
+
+    print(f'  ✅ 数据已归一化用于预测器训练')
+
+    # Build predictor
+    predictor = Predictor(dim - 1, hidden_dim).to(device)
+
+    # Loss and optimizer
+    criterion = nn.L1Loss()
+    optimizer = torch.optim.Adam(predictor.parameters())
+
+    # Training using Synthetic dataset (使用归一化的数据)
+    predictor.train()
+    for itt in range(iterations):
+        # Set mini-batch
+        idx = np.random.permutation(len(generated_data_norm))
+        train_idx = idx[:batch_size]
+
+        X_mb = list(generated_data_norm[i][:-1, :(dim - 1)] for i in train_idx)
+        T_mb = list(generated_time[i] - 1 for i in train_idx)
+        Y_mb = list(np.reshape(generated_data_norm[i][1:, (dim - 1)],
+                               [len(generated_data_norm[i][1:, (dim - 1)]), 1]) for i in train_idx)
+
+        # Convert to tensors
+        X_mb = torch.FloatTensor(np.array(X_mb)).to(device)
+        Y_mb = torch.FloatTensor(np.array(Y_mb)).to(device)
+        T_mb = torch.LongTensor(T_mb).cpu()
+
+        # Forward pass
+        y_pred = predictor(X_mb, T_mb)
+
+        # Compute loss
+        p_loss = criterion(y_pred, Y_mb)
+
+        # Backward and optimize
+        optimizer.zero_grad()
+        p_loss.backward()
+        optimizer.step()
+
+    # Test the trained model on the original data (使用归一化的数据)
+    predictor.eval()
+    with torch.no_grad():
+        idx = np.random.permutation(len(ori_data_norm))
+        train_idx = idx[:no]
+
+        X_mb = list(ori_data_norm[i][:-1, :(dim - 1)] for i in train_idx)
+        T_mb = list(ori_time[i] - 1 for i in train_idx)
+        Y_mb = list(np.reshape(ori_data_norm[i][1:, (dim - 1)],
+                               [len(ori_data_norm[i][1:, (dim - 1)]), 1]) for i in train_idx)
+
+        # Convert to tensors
+        X_mb = torch.FloatTensor(np.array(X_mb)).to(device)
+        T_mb = torch.LongTensor(T_mb).cpu()
+
+        # Prediction
+        pred_Y_curr = predictor(X_mb, T_mb)
+        pred_Y_curr = pred_Y_curr.cpu().numpy()
+
+    # Compute the performance in terms of MAE
+    MAE_temp = 0
+    for i in range(no):
+        MAE_temp = MAE_temp + mean_absolute_error(Y_mb[i], pred_Y_curr[i, :, :])
+
+    predictive_score = MAE_temp / no
+
+    print(f'  📊 Predictive Score: {predictive_score:.4f}')
+
+    return predictive_score
+"""Time-series Generative Adversarial Networks (TimeGAN) Codebase.
+
+Reference: Jinsung Yoon, Daniel Jarrett, Mihaela van der Schaar,
+"Time-series Generative Adversarial Networks,"
+Neural Information Processing Systems (NeurIPS), 2019.
+
+Paper link: https://papers.nips.cc/paper/8789-time-series-generative-adversarial-networks
+
+Last updated Date: April 24th 2020
+Code author: Jinsung Yoon (jsyoon0823@gmail.com)
+
+-----------------------------
+
+visualization_metrics.py
+
+Note: Use PCA or tSNE for generated and original data visualization
+"""
+
+# Necessary packages
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def visualization(ori_data, generated_data, analysis):
+    """Using PCA or tSNE for generated and original data visualization.
+
+    Args:
+        - ori_data: original data
+        - generated_data: generated synthetic data
+        - analysis: tsne or pca
+    """
+    # Analysis sample size (for faster computation)
+    anal_sample_no = min([1000, len(ori_data)])
+    idx = np.random.permutation(len(ori_data))[:anal_sample_no]
+
+    # Data preprocessing
+    ori_data = np.asarray(ori_data)
+    generated_data = np.asarray(generated_data)
+
+    ori_data = ori_data[idx]
+    generated_data = generated_data[idx]
+
+    no, seq_len, dim = ori_data.shape
+
+    for i in range(anal_sample_no):
+        if (i == 0):
+            prep_data = np.reshape(np.mean(ori_data[0, :, :], 1), [1, seq_len])
+            prep_data_hat = np.reshape(np.mean(generated_data[0, :, :], 1), [1, seq_len])
+        else:
+            prep_data = np.concatenate((prep_data,
+                                        np.reshape(np.mean(ori_data[i, :, :], 1), [1, seq_len])))
+            prep_data_hat = np.concatenate((prep_data_hat,
+                                            np.reshape(np.mean(generated_data[i, :, :], 1), [1, seq_len])))
+
+    # Visualization parameter
+    colors = ["red" for i in range(anal_sample_no)] + ["blue" for i in range(anal_sample_no)]
+
+    if analysis == 'pca':
+        # PCA Analysis
+        pca = PCA(n_components=2)
+        pca.fit(prep_data)
+        pca_results = pca.transform(prep_data)
+        pca_hat_results = pca.transform(prep_data_hat)
+
+        # Plotting
+        f, ax = plt.subplots(1)
+        plt.scatter(pca_results[:, 0], pca_results[:, 1],
+                    c=colors[:anal_sample_no], alpha=0.2, label="Original")
+        plt.scatter(pca_hat_results[:, 0], pca_hat_results[:, 1],
+                    c=colors[anal_sample_no:], alpha=0.2, label="Synthetic")
+
+        ax.legend()
+        plt.title('PCA plot')
+        plt.xlabel('x-pca')
+        plt.ylabel('y_pca')
+        plt.show()
+
+    elif analysis == 'tsne':
+
+        # Do t-SNE Analysis together
+        prep_data_final = np.concatenate((prep_data, prep_data_hat), axis=0)
+
+        # TSNE analysis
+        tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300)
+        tsne_results = tsne.fit_transform(prep_data_final)
+
+        # Plotting
+        f, ax = plt.subplots(1)
+
+        plt.scatter(tsne_results[:anal_sample_no, 0], tsne_results[:anal_sample_no, 1],
+                    c=colors[:anal_sample_no], alpha=0.2, label="Original")
+        plt.scatter(tsne_results[anal_sample_no:, 0], tsne_results[anal_sample_no:, 1],
+                    c=colors[anal_sample_no:], alpha=0.2, label="Synthetic")
+
+        ax.legend()
+
+        plt.title('t-SNE plot')
+        plt.xlabel('x-tsne')
+        plt.ylabel('y_tsne')
+        plt.show()
